@@ -1,8 +1,9 @@
+import argparse
 import os
 from random import randint
+from types import SimpleNamespace
 import uuid
 
-from quinine import QuinineArgumentParser
 from tqdm import tqdm
 import torch
 import yaml
@@ -11,12 +12,95 @@ from eval import get_run_metrics
 from tasks import get_task_sampler
 from samplers import get_data_sampler
 from curriculum import Curriculum
-from schema import schema
 from models import build_model
 
 import wandb
 
 torch.backends.cudnn.benchmark = True
+
+
+def _load_yaml_with_inherit(path):
+    """Load a YAML config, resolving any `inherit:` list of relative paths."""
+    path = os.path.abspath(path)
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+
+    parents = cfg.pop("inherit", []) or []
+    base_dir = os.path.dirname(path)
+
+    merged = {}
+    for parent in parents:
+        parent_path = parent if os.path.isabs(parent) else os.path.join(base_dir, parent)
+        merged = _deep_merge(merged, _load_yaml_with_inherit(parent_path))
+
+    return _deep_merge(merged, cfg)
+
+
+def _deep_merge(base, override):
+    out = dict(base)
+    for k, v in override.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _dict_to_ns(d):
+    if isinstance(d, dict):
+        return SimpleNamespace(**{k: _dict_to_ns(v) for k, v in d.items()})
+    if isinstance(d, list):
+        return [_dict_to_ns(v) for v in d]
+    return d
+
+
+def _ns_to_dict(ns):
+    if isinstance(ns, SimpleNamespace):
+        return {k: _ns_to_dict(v) for k, v in ns.__dict__.items()}
+    if isinstance(ns, list):
+        return [_ns_to_dict(v) for v in ns]
+    return ns
+
+
+def _apply_defaults(cfg):
+    """Fill in defaults that quinine's schema used to provide."""
+    cfg.setdefault("test_run", False)
+    training = cfg.setdefault("training", {})
+    training.setdefault("task_kwargs", {})
+    training.setdefault("num_tasks", None)
+    training.setdefault("num_training_examples", None)
+    training.setdefault("resume_id", None)
+    training.setdefault("batch_size", 64)
+    training.setdefault("learning_rate", 3e-4)
+    training.setdefault("train_steps", 1000)
+    training.setdefault("save_every_steps", 1000)
+    training.setdefault("keep_every_steps", -1)
+    wandb_cfg = cfg.setdefault("wandb", {})
+    wandb_cfg.setdefault("project", "in-context-training")
+    wandb_cfg.setdefault("entity", "in-context")
+    wandb_cfg.setdefault("notes", "")
+    wandb_cfg.setdefault("name", None)
+    wandb_cfg.setdefault("log_every_steps", 10)
+    return cfg
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
+    parser.add_argument("--test_run", action="store_true", help="Override test_run=True")
+    parser.add_argument("--out_dir", type=str, default=None, help="Override out_dir")
+    cli = parser.parse_args()
+
+    cfg = _apply_defaults(_load_yaml_with_inherit(cli.config))
+    if cli.test_run:
+        cfg["test_run"] = True
+    if cli.out_dir is not None:
+        cfg["out_dir"] = cli.out_dir
+
+    if "out_dir" not in cfg:
+        raise ValueError("config must specify out_dir")
+
+    return _dict_to_ns(cfg)
 
 
 def train_step(model, xs, ys, optimizer, loss_func):
@@ -57,7 +141,7 @@ def train(model, args):
         n_dims,
         bsize,
         num_tasks=args.training.num_tasks,
-        **args.training.task_kwargs,
+        **_ns_to_dict(args.training.task_kwargs),
     )
     pbar = tqdm(range(starting_step, args.training.train_steps))
 
@@ -145,7 +229,7 @@ def main(args):
             dir=args.out_dir,
             project=args.wandb.project,
             entity=args.wandb.entity,
-            config=args.__dict__,
+            config=_ns_to_dict(args),
             notes=args.wandb.notes,
             name=args.wandb.name,
             resume=True,
@@ -162,10 +246,9 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = QuinineArgumentParser(schema=schema)
-    args = parser.parse_quinfig()
+    args = parse_args()
     assert args.model.family in ["gpt2", "lstm"]
-    print(f"Running with: {args}")
+    print(f"Running with: {_ns_to_dict(args)}")
 
     if not args.test_run:
         run_id = args.training.resume_id
@@ -178,6 +261,6 @@ if __name__ == "__main__":
         args.out_dir = out_dir
 
         with open(os.path.join(out_dir, "config.yaml"), "w") as yaml_file:
-            yaml.dump(args.__dict__, yaml_file, default_flow_style=False)
+            yaml.dump(_ns_to_dict(args), yaml_file, default_flow_style=False)
 
     main(args)
